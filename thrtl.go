@@ -16,7 +16,7 @@ import (
 )
 
 var (
-	socket = flag.String("socket", "", "control socket")
+	ctl = flag.String("ctl", ":0", "Control location - (eg: <addr>:<port>)")
 )
 
 func usage() {
@@ -37,42 +37,40 @@ func main() {
 		},
 	}
 	var clean []func()
+	done := make(chan struct{})
 
 	kill := make(chan os.Signal)
 	signal.Notify(kill, syscall.SIGINT, syscall.SIGQUIT)
 
-	if *socket != "" {
-		ul, err := net.ListenUnix("unix", &net.UnixAddr{Net: "unix", Name: *socket})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Err listening on unix socket: %s\n", err)
-			os.Exit(1)
-		}
-
-		socketDone := make(chan struct{})
-		clean = append(clean, func() {
-			os.Remove(*socket)
-			close(socketDone)
-		})
-
-		go func() {
-			defer ul.Close()
-			for {
-				c, err := ul.Accept()
-				if err != nil {
-					continue
-				}
-				go term(c, s.newRate, func() int64 {
-					return s.throttle.KBps
-				})
-
-				select {
-				case <-socketDone:
-					return
-				default:
-				}
-			}
-		}()
+	list, err := net.Listen("tcp", *ctl)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Err listening on addr: %s\n", err)
+		os.Exit(1)
 	}
+	if tcpAddr, ok := list.Addr().(*net.TCPAddr); ok {
+		fmt.Fprintf(os.Stderr, "Connect to control plane using telnet %s %d\n", tcpAddr.IP, tcpAddr.Port)
+	} else {
+		fmt.Fprintf(os.Stderr, "Control plane ready at %v\n", list.Addr())
+	}
+
+	go func() {
+		defer list.Close()
+		for {
+			c, err := list.Accept()
+			if err != nil {
+				continue
+			}
+			go term(c, s.newRate, func() int64 {
+				return s.throttle.KBps
+			})
+
+			select {
+			case <-done:
+				return
+			default:
+			}
+		}
+	}()
 
 	// this is the important bit
 	clean = append(clean, func() {
@@ -80,10 +78,14 @@ func main() {
 	})
 	go func() {
 		io.Copy(os.Stdout, s)
-		close(kill)
+		close(done)
 	}()
 
-	<-kill
+	select {
+	case <-kill:
+	case <-done:
+	}
+
 	for _, c := range clean {
 		c()
 	}
